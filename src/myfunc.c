@@ -1,0 +1,361 @@
+#include <math.h>
+#include <stdio.h>
+#include <stdarg.h>
+#include <gsl/gsl_cdf.h>
+#include <gsl/gsl_randist.h>
+#include <gsl/gsl_blas.h>
+#include <gsl/gsl_vector.h>
+#include <gsl/gsl_statistics_double.h>
+#include "../include/type.h"
+#include "../include/util.h"
+#include "../include/myfunc.h"
+#include "../include/global.h"
+#include "../include/cthreadpool.h"
+
+
+#define ITER_CUTOFF 0.01
+#define MAXFUN 15000
+#define MAXITER 15000
+#define FUNC_MARGINAL_ARG_LEN 7
+#define FUNC_INDIVIDUAL_ARG_LEN 8
+
+int vec2psi(gsl_vector* psi, gsl_vector *inc, gsl_vector *skp,
+            int inclu_len, int skip_len) {
+    size_t idx;
+    for(idx = 0; idx < inc->size; ++idx) {
+        if (gsl_vector_get(inc, idx) == 0 && gsl_vector_get(skp, idx) == 0) {
+            gsl_vector_set(psi, idx, 0.5);
+            //ignore the difference between int and float
+        }
+        else if (gsl_vector_get(inc, idx) == 0){
+                 gsl_vector_set(psi, idx, 0.01);
+        }
+        else if (gsl_vector_get(skp, idx) == 0){
+                 gsl_vector_set(psi, idx, 0.99);
+        }
+        else {
+            gsl_vector_set(psi, idx, gsl_vector_get(inc, idx)/inclu_len/
+                    (gsl_vector_get(inc, idx)/inclu_len + gsl_vector_get(skp, idx)/skip_len));
+        }
+    }
+    return 0;
+}
+
+double myfunc_individual(const double x[], va_list argv) {
+    double I = va_arg(argv, double), S = va_arg(argv, double);
+    double beta0 = va_arg(argv, double), beta1 = va_arg(argv, double);
+    double var = va_arg(argv, double);
+    double gene_exp = va_arg(argv, double);  //Don't know the type of gene_exp
+    int inclu_len = va_arg(argv, int), skip_len = va_arg(argv, int);
+    double new_psi = inclu_len * x[0]/(inclu_len * x[0] + skip_len * (1 - x[0]));
+    
+    // TODO This change the result.
+    return -1.0 * ( I * log(new_psi) + S*log(1-new_psi) - pow((logit(x[0])-(beta0 + beta1 * gene_exp)),2)/(2*var)-log(x[0]) - log(1-x[0]) - log(sqrt(var)));
+}
+
+
+void myfunc_individual_der(const double x[], double res[], va_list argv) {
+    double I = va_arg(argv, double), S = va_arg(argv, double);
+    double beta0 = va_arg(argv, double), beta1 = va_arg(argv, double);
+    double var = va_arg(argv, double), gene_exp = va_arg(argv, double);
+    int inclu_len = va_arg(argv, int), skip_len = va_arg(argv, int);
+    double part1 = (beta0 + beta1 * gene_exp - logit(x[0])) / (var *
+    (double)x[0] * (1-x[0]) -1.0/x[0] +1.0/(1-x[0]));
+    //为了和part1的类型统一，把float(x*(1-x))改成double(x*(1-x))
+    double part2 =I * 1.0 / x[0] + S * 1.0 / (x[0]-1) - (I + S) *((inclu_len -
+    skip_len) / (inclu_len * x[0] + skip_len * (1-x[0])));
+    //因为part2和part3有很多重复的部分所以整合了一下
+    res[0] = -1.0 * (part1 + part2);
+    return;
+}
+
+double myfunc_marginal_integrated(const double x[], va_list argv) {
+    gsl_vector* I = va_arg(argv, gsl_vector*), *S = va_arg(argv, gsl_vector*);
+    gsl_vector* psi = va_arg(argv, gsl_vector*);
+    double var = va_arg(argv, double),  sum = 0;
+    gsl_vector* gene_exp = va_arg(argv, gsl_vector*);
+    int inclu_len = va_arg(argv, int), skip_len = va_arg(argv, int), idx = 0;
+
+    sum = cuscumsum(psi, sum_for_marginal_integrated, 9, &idx, x[0], x[1], I, S, var, gene_exp, inclu_len, skip_len);
+    
+    return sum;
+}
+//方案1
+/*
+void myfunc_marginal_integrated_der(const double x[], double res[], va_list argv) {
+    gsl_vector* I = va_arg(argv, gsl_vector*), *S = va_arg(argv, gsl_vector*);
+    gsl_vector* psi = va_arg(argv, gsl_vector*);
+    double var = va_arg(argv, double), sum1, sum2;
+    sum1 = sum2 = 0.0;
+    gsl_vector* gene_exp = va_arg(argv, gsl_vector*);
+    int inclu_len = va_arg(argv, int), skip_len = va_arg(argv, int), idx = 0;
+
+
+    sum1 = cuscumsum(psi, sum_for_marginal_integrated_1_der, 9, &idx, x[0], x[1], I, S, var, gene_exp, inclu_len, skip_len);
+    idx=0;
+    sum2 = cuscumsum(psi, sum_for_marginal_integrated_2_der, 9, &idx, x[0], x[1], I, S, var, gene_exp, inclu_len, skip_len);
+    res[0] = sum1;
+    res[1] = sum2;
+
+    return;
+}
+*/
+//方案2
+void myfunc_marginal_integrated_der(const double x[], double res[], va_list argv) {
+    gsl_vector* I = va_arg(argv, gsl_vector*), *S = va_arg(argv, gsl_vector*);
+    gsl_vector* psi = va_arg(argv, gsl_vector*);
+    double var = va_arg(argv, double);
+    gsl_vector* gene_exp = va_arg(argv, gsl_vector*);
+    double* tmp;
+    int inclu_len = va_arg(argv, int), skip_len = va_arg(argv, int), idx = 0;
+    
+    tmp = cuscumsum_der(psi, sum_for_marginal_integrated_der, 9, &idx, x[0],x[1], I, S, var, gene_exp, inclu_len, skip_len);
+    res[0] = *tmp;
+    res[1] = *(++tmp);
+    
+    return;
+}
+
+void mle_result_set(mle_result * mle, double sum, gsl_vector * psi, double beta0, double beta1, double var) {
+    mle->sum = sum;
+    mle->params.psi = psi;
+    mle->params.beta0 = beta0;
+    mle->params.beta1 = beta1;
+    mle->params.var = var;
+}
+
+
+int MLE_marginal_iteration(gsl_vector* inc, gsl_vector* skp, gsl_vector* gene_exp,
+        const int inclu_len, const int skip_len, mle_result * mle) {
+    double slope, intercept;
+    double iter_cutoff, previous_sum, current_sum;
+    int iter_maxrun, count, i;
+    double cov00 = 0.0, cov01 = 0.0, cov11 = 0.0, sumsq = 0.0;
+    double var, beta[2];
+    gsl_vector* psi = gsl_vector_calloc(inc->size);
+    gsl_vector *ltemp = gsl_vector_calloc(psi->size);
+    integer n, m = 10, nbd[nmax];
+    doublereal x[nmax], l[nmax], u[nmax], factr=1.0e7, pgtol=1.0e-5, iprint=-1;
+
+    if (!vec2psi(psi, inc, skp, inclu_len, skip_len)) {
+        return 0;//failed
+    }
+    for (i = 0; i != psi->size; i++) {
+        double temp = gsl_vector_get(psi, i);
+        temp = logit(temp);
+        gsl_vector_set(ltemp, i, temp);
+    }
+    var = gsl_stats_variance(ltemp->data, 1, ltemp->size) / 2;
+    if (var <= 0.01) { var = 0.01; }
+
+    gsl_fit_linear(skp->data, 1, ltemp->data, 1, ltemp->size, &slope, &intercept, &cov00, &cov01, &cov11, &sumsq);
+    beta[0] = slope, beta[1] = intercept;
+
+    iter_cutoff = 1.0, iter_maxrun = 100, count = 0, previous_sum = 0.0, current_sum = 0.0;
+    while ((iter_cutoff > ITER_CUTOFF) && (count <= iter_maxrun)) {
+        count ++;
+
+        /*xopt = fmin_l_bfgs_b(myfunc_marginal_integrated, beta, myfunc_marginal_integrated_der,
+        args = [inc, skc, psi, var, gene_expression, effective_inclusion_length, effective_skipping_length],
+        bounds = [[-99999999.0, 99999999.0], [-99999999.0, 99999999.0]], iprint = -1);
+        beta = xopt[0];*/
+
+        n = 2;
+        for (i = 0;i < n;i++) {
+            nbd[i] = 2;
+            l[i] = -99999999.0;
+            u[i] = 99999999.0;
+            x[i] = beta[i];
+        }
+
+        l_bfgs_b_wrapper(n, m, x, l, u, nbd,
+            myfunc_marginal_integrated, myfunc_marginal_integrated_der, 
+            factr, pgtol, iprint, MAXFUN, MAXITER, FUNC_MARGINAL_ARG_LEN,
+            inc, skp, psi, var, gene_exp, inclu_len, skip_len);
+
+        beta[0] = x[0], beta[1] = x[1];
+
+        gsl_vector *new_psi = gsl_vector_calloc(psi->size);
+        current_sum = 0, n = 1;
+        nbd[0] = 2, l[0] = 0.01, u[0] = 0.99;
+        for (i = 0; i != psi->size; i++) {
+            /*xopt = fmin_l_bfgs_b(myfunc_individual, [psi[i]], myfunc_individual_der, args = [inc[i], skc[i], beta[0], beta[1], var,
+            gene_expression[i], effective_inclusion_length, effective_skipping_length], bounds = [[0.01, 0.99]], iprint = -1);
+            new_psi.append(float(xopt[0])); current_sum+=float(xopt[1]);*/
+            x[0] = gsl_vector_get(psi, i);
+            current_sum += (double)l_bfgs_b_wrapper(n, m, x, l, u, nbd,
+                myfunc_individual, myfunc_individual_der,
+                factr, pgtol, iprint, MAXFUN, MAXITER, FUNC_INDIVIDUAL_ARG_LEN,
+                gsl_vector_get(inc, i), gsl_vector_get(skp, i), beta[0], beta[1], var,
+                gsl_vector_get(gene_exp, i), inclu_len, skip_len);
+
+            gsl_vector_set(new_psi, i, x[0]);
+        }
+
+        psi = new_psi;
+        iter_cutoff = fabs(previous_sum - current_sum);
+        previous_sum = current_sum;
+    }
+
+    if (count > iter_maxrun) {
+        mle_result_set(mle, current_sum, psi, 0, 0, var);
+    }
+    else {
+        mle_result_set(mle, current_sum, psi, beta[0], beta[1], var);
+    }
+
+    gsl_vector_free(psi);
+    gsl_vector_free(ltemp);
+
+    return 1;
+}
+
+int MLE_marginal_iteration_constrain(gsl_vector* inc, gsl_vector* skp, gsl_vector* gene_exp, 
+        const int inclu_len, const int skip_len, mle_result * mle, double base_line) {
+    double slope, intercept;
+    double iter_cutoff, previous_sum, current_sum;
+    int iter_maxrun, count, i;
+    double cov00 = 0.0, cov01 = 0.0, cov11 = 0.0, sumsq = 0.0;
+    double var, beta[2];
+    gsl_vector* psi = gsl_vector_calloc(inc->size);
+    gsl_vector *ltemp = gsl_vector_calloc(psi->size);
+    integer n, m = 10, nbd[nmax];
+    doublereal x[nmax], l[nmax], u[nmax], factr=1.0e7, pgtol=1.0e-5, iprint=-1;
+
+    if (!vec2psi(psi, inc, skp, inclu_len, skip_len)) {
+     
+        return 0;//failed
+    }
+    for (i = 0; i != psi->size; i++) {
+        double temp = gsl_vector_get(psi, i);
+        temp = logit(temp);
+        gsl_vector_set(ltemp, i, temp);
+    }
+
+    var = gsl_stats_variance(ltemp->data, 1, ltemp->size) / 2;
+    if (var <= 0.01) { var = 0.01; }
+    gsl_fit_linear(skp->data, 1, ltemp->data, 1, ltemp->size, &slope, &intercept, &cov00, &cov01, &cov11, &sumsq);
+    beta[0] = slope, beta[1] = intercept;
+
+    iter_cutoff = 1.0, iter_maxrun = 100, count = 0, previous_sum = 0.0, current_sum = 0.0;
+    while ((iter_cutoff > ITER_CUTOFF) && (count <= iter_maxrun)) 
+    {
+        count++;
+        /*xopt = fmin_l_bfgs_b(myfunc_marginal_integrated, beta, myfunc_marginal_integrated_der,
+            args = [inc, skc, psi, var, gene_expression, effective_inclusion_length, effective_skipping_length],
+            bounds = [[-9999999.0, 9999999.0], [base_line, base_line]], iprint = -1);
+            beta=xopt[0];*/
+
+        n = 2;
+        for (i = 0;i < n;i++) {
+            nbd[i] = 2;
+            x[i] = beta[i];
+        }
+        l[0] = -99999999.0, u[0] = 99999999.0;
+        l[1] = base_line, u[1] = base_line; 
+
+        l_bfgs_b_wrapper(n, m, x, l, u, nbd,
+            myfunc_marginal_integrated, myfunc_marginal_integrated_der,
+            factr, pgtol, iprint, MAXFUN, MAXITER, 7,
+            inc, skp, psi, var, gene_exp, inclu_len, skip_len);
+
+        beta[0] = x[0], beta[1] = x[1];
+        
+        gsl_vector *new_psi = gsl_vector_calloc(psi->size);
+        current_sum = 0, n = 1;
+        nbd[0] = 2, l[0] = 0.01, u[0] = 0.99;
+        for (i = 0; i != psi->size; i++) {
+            /*xopt = fmin_l_bfgs_b(myfunc_individual, [psi[i]], myfunc_individual_der, args = [inc[i], skc[i], beta[0], beta[1], var,
+            gene_expression[i], effective_inclusion_length, effective_skipping_length], bounds = [[0.01, 0.99]], iprint = -1);
+            new_psi.append(float(xopt[0])); current_sum+=float(xopt[1]);*/
+            x[0] = gsl_vector_get(psi, i);
+            current_sum += (double)l_bfgs_b_wrapper(n, m, x, l, u, nbd,
+                myfunc_individual, myfunc_individual_der,
+                factr, pgtol, iprint, MAXFUN, MAXITER, FUNC_INDIVIDUAL_ARG_LEN,
+                gsl_vector_get(inc, i), gsl_vector_get(skp, i), beta[0], beta[1], var,
+                gsl_vector_get(gene_exp, i), inclu_len, skip_len);
+
+            gsl_vector_set(new_psi, i, x[0]);
+        }
+
+        psi = new_psi;
+        iter_cutoff = fabs(previous_sum - current_sum);
+        previous_sum = current_sum;
+        gsl_vector_free(new_psi);
+    }
+    gsl_vector_free(psi);
+    gsl_vector_free(ltemp);
+
+    return 0;
+}
+
+double* likelihood_test(gsl_vector* inc, gsl_vector* skp, gsl_vector* gene_exp, 
+        int inclu_len, int skip_len, double delta, int flag, char* id) {
+    mle_result result;
+    double* likelireasult;
+    double Base;
+    mle_result result_constrain;
+
+    likelireasult = (double*)malloc(sizeof(double) * 3);
+
+    MLE_marginal_iteration(inc, skp, gene_exp, inclu_len, skip_len, &result);
+    Base = fabs(delta);
+    if (Base < 0.01) {
+        if (fabs(result.params.beta1 - 0.0) < 0.0001) {
+            likelireasult[0] = 1;
+            likelireasult[1] = result.params.beta0;
+            likelireasult[2] = result.params.beta1;
+            return likelireasult;
+        }
+        else {
+            MLE_marginal_iteration_constrain(inc, skp, gene_exp, inclu_len, skip_len, &result_constrain, 0.0);
+            likelireasult[0] = gsl_cdf_chisq_P(2 * (fabs(result_constrain.sum - result.sum)), 1);
+            likelireasult[1] = result.params.beta0;
+            likelireasult[2] = result.params.beta1;
+            return likelireasult;
+        }
+    }
+    else {
+        if (fabs(result.params.beta1) < Base) {
+            likelireasult[0] = 1;
+            likelireasult[1] = result.params.beta0;
+            likelireasult[2] = result.params.beta1;
+            return likelireasult;
+        }
+        else {
+            if (result.params.beta1 < 0.0) {
+                Base = -Base;
+            }
+            MLE_marginal_iteration_constrain(inc, skp, gene_exp, inclu_len, skip_len, &result_constrain, Base);
+            likelireasult[0] = gsl_cdf_chisq_P(2 * (fabs(result_constrain.sum - result.sum)), 1);
+            likelireasult[1] = result.params.beta0;
+            likelireasult[2] = result.params.beta1;
+            return likelireasult;
+        }
+    }
+}
+
+void* thread_wrapper_for_LT(void* arg) {
+    double *ret;
+    odiff *data = (odiff*)arg;
+    ret = likelihood_test(data->inc, data->skp, data->gene_exp,
+                           data->inclu_len, data->skip_len, data->delta,
+                           data->flag, data->id);
+    return (void*)ret;
+}
+
+
+void* batch_wrapper_for_LT(void* arg) {
+    batch_datum *args = (batch_datum*)arg;
+    int batch_size = args->batch_size, i;
+    double** ret = (double**)malloc(sizeof(double*)*batch_size);
+    odiff *datum = (odiff*)*args->datum;
+    odiff data;
+    for (i = 0; i < batch_size; ++i) {
+        data = datum[i];
+        ret[i] = likelihood_test(data.inc, data.skp, data.gene_exp,
+                                 data.inclu_len, data.skip_len, data.delta,
+                                 data.flag, data.id);
+    }
+    return (void*)ret;
+}
